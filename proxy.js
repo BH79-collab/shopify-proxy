@@ -1,15 +1,14 @@
 const http  = require("http");
 const https = require("https");
 
-const CORS_HEADERS = {
-  "Access-Control-Allow-Origin":  "*",
-  "Access-Control-Allow-Headers": "x-shopify-token, Content-Type, Authorization",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-};
+const PORT = process.env.PORT || 3001;
+const HOST = "0.0.0.0";
 
 http.createServer((req, res) => {
 
-  Object.entries(CORS_HEADERS).forEach(([k, v]) => res.setHeader(k, v));
+  res.setHeader("Access-Control-Allow-Origin",  "*");
+  res.setHeader("Access-Control-Allow-Headers", "x-shopify-token, Content-Type");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
 
   if (req.method === "OPTIONS") {
     res.writeHead(204);
@@ -17,16 +16,12 @@ http.createServer((req, res) => {
   }
 
   let u;
-  try {
-    u = new URL(req.url, "http://localhost");
-  } catch {
-    res.writeHead(400);
-    return res.end(JSON.stringify({ error: "Invalid URL" }));
-  }
+  try { u = new URL(req.url, "http://localhost"); }
+  catch(e) { res.writeHead(400); return res.end(JSON.stringify({ error: "bad url" })); }
 
   if (u.pathname !== "/shopify") {
     res.writeHead(400);
-    return res.end(JSON.stringify({ error: "Bad request — use /shopify endpoint" }));
+    return res.end(JSON.stringify({ error: "use /shopify endpoint" }));
   }
 
   const store = u.searchParams.get("store");
@@ -35,37 +30,28 @@ http.createServer((req, res) => {
 
   if (!store || !path || !token) {
     res.writeHead(400);
-    return res.end(JSON.stringify({ error: "Missing store, path or x-shopify-token header" }));
+    return res.end(JSON.stringify({ error: "missing store, path or token" }));
   }
 
-  const cleanStore = store.trim()
-    .replace(/^https?:\/\//i, "")
-    .replace(/\/+$/, "");
-
-  let target;
-  try {
-    target = new URL("https://" + cleanStore + "/admin/api/2024-01/" + path);
-  } catch {
-    res.writeHead(400);
-    return res.end(JSON.stringify({ error: "Invalid store URL: " + cleanStore }));
-  }
+  const clean  = store.trim().replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+  const target = new URL("https://" + clean + "/admin/api/2024-01/" + path);
 
   const options = {
     hostname: target.hostname,
     path:     target.pathname + target.search,
     method:   "GET",
-    headers:  {
+    headers: {
       "X-Shopify-Access-Token": token,
       "Content-Type":           "application/json",
       "Accept":                 "application/json",
     },
   };
 
-  const shopReq = https.request(options, (shopRes) => {
+  const r = https.request(options, (sr) => {
     let body = "";
-    shopRes.on("data",  chunk => { body += chunk; });
-    shopRes.on("end",   () => {
-      res.writeHead(shopRes.statusCode, {
+    sr.on("data", c => body += c);
+    sr.on("end",  () => {
+      res.writeHead(sr.statusCode, {
         "Content-Type":                "application/json",
         "Access-Control-Allow-Origin": "*",
       });
@@ -73,19 +59,19 @@ http.createServer((req, res) => {
     });
   });
 
-  shopReq.on("error", (err) => {
+  r.on("error", e => {
     res.writeHead(502);
-    res.end(JSON.stringify({ error: "Shopify request failed: " + err.message }));
+    res.end(JSON.stringify({ error: e.message }));
   });
 
-  shopReq.setTimeout(10000, () => {
-    shopReq.destroy();
+  r.setTimeout(15000, () => {
+    r.destroy();
     res.writeHead(504);
-    res.end(JSON.stringify({ error: "Shopify request timed out" }));
+    res.end(JSON.stringify({ error: "timeout" }));
   });
 
-  shopReq.end();
+  r.end();
 
-}).listen(process.env.PORT || 3001, () => {
-  console.log("Proxy ready on port " + (process.env.PORT || 3001));
+}).listen(PORT, HOST, () => {
+  console.log(`Proxy ready on http://${HOST}:${PORT}`);
 });
