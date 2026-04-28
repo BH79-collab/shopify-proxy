@@ -77,7 +77,7 @@ http.createServer(async (req, res) => {
   try { u = new URL(req.url, "http://localhost"); }
   catch { res.writeHead(400); return res.end(JSON.stringify({ error: "bad url" })); }
 
-  // ── POST /stripe/checkout ──────────────────────────────────────────────────
+  // POST /stripe/checkout
   if (req.method === "POST" && u.pathname === "/stripe/checkout") {
     const raw = await readBody(req);
     try {
@@ -123,7 +123,7 @@ http.createServer(async (req, res) => {
     return;
   }
 
-  // ── POST /stripe/subscribe ─────────────────────────────────────────────────
+  // POST /stripe/subscribe
   if (req.method === "POST" && u.pathname === "/stripe/subscribe") {
     const raw = await readBody(req);
     try {
@@ -164,7 +164,7 @@ http.createServer(async (req, res) => {
     return;
   }
 
-  // ── POST /stripe/webhook ───────────────────────────────────────────────────
+  // POST /stripe/webhook
   if (req.method === "POST" && u.pathname === "/stripe/webhook") {
     const raw = await readBody(req);
     const sig = req.headers["stripe-signature"];
@@ -201,11 +201,9 @@ http.createServer(async (req, res) => {
       if (event.type === "customer.subscription.deleted") {
         await supabasePatch("subscriptions", { stripe_subscription_id: `eq.${obj.id}` }, { status: "cancelled" });
       }
-      // Handle checkout session completed
       if (event.type === "checkout.session.completed") {
-        const sessionId = obj.id;
         const subId = obj.subscription;
-        if (subId) await supabasePatch("subscriptions", { stripe_subscription_id: `eq.${sessionId}` }, { stripe_subscription_id: subId, status: "active" });
+        if (subId) await supabasePatch("subscriptions", { stripe_subscription_id: `eq.${obj.id}` }, { stripe_subscription_id: subId, status: "active" });
       }
     } catch (e) {
       console.error("Webhook handler error:", e.message);
@@ -214,7 +212,70 @@ http.createServer(async (req, res) => {
     return;
   }
 
-  // ── GET /shopify ───────────────────────────────────────────────────────────
+  // POST /shopify/orders (Shopify webhook saves orders to Supabase)
+  if (req.method === "POST" && u.pathname === "/shopify/orders") {
+    const raw = await readBody(req);
+    try {
+      const order = JSON.parse(raw.toString());
+      const lineItems = (order.line_items || []).map(item => ({
+        product_id: item.product_id?.toString(),
+        title:      item.title,
+        quantity:   item.quantity,
+        price:      parseFloat(item.price),
+        vendor:     item.vendor,
+        sku:        item.sku,
+      }));
+      const orderBody = JSON.stringify({
+        shopify_order_id: order.id?.toString(),
+        order_number:     order.order_number?.toString(),
+        customer_name:    `${order.customer?.first_name || ""} ${order.customer?.last_name || ""}`.trim(),
+        customer_email:   order.customer?.email || "",
+        total_price:      parseFloat(order.total_price || 0),
+        line_items:       lineItems,
+        status:           order.financial_status || "pending",
+        created_at:       order.created_at,
+      });
+      await httpsReq({
+        hostname: SUPA_URL.replace("https://", ""),
+        path:     "/rest/v1/orders",
+        method:   "POST",
+        headers: {
+          "apikey":         SUPA_KEY,
+          "Authorization":  "Bearer " + SUPA_KEY,
+          "Content-Type":   "application/json",
+          "Content-Length": Buffer.byteLength(orderBody),
+          "Prefer":         "return=minimal",
+        },
+      }, orderBody);
+      res.writeHead(200); res.end(JSON.stringify({ received: true }));
+    } catch (e) {
+      console.error("Order webhook error:", e.message);
+      res.writeHead(500); res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // GET /supabase/orders (payout app reads orders from Supabase)
+  if (req.method === "GET" && u.pathname === "/supabase/orders") {
+    try {
+      const r = await httpsReq({
+        hostname: SUPA_URL.replace("https://", ""),
+        path:     "/rest/v1/orders?select=*&order=created_at.desc&limit=250",
+        method:   "GET",
+        headers: {
+          "apikey":        SUPA_KEY,
+          "Authorization": "Bearer " + SUPA_KEY,
+        },
+      });
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(r.body);
+    } catch (e) {
+      res.writeHead(500); res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // GET /shopify
   if (u.pathname === "/shopify") {
     const store = u.searchParams.get("store");
     const path  = u.searchParams.get("path");
