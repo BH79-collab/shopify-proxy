@@ -203,7 +203,72 @@ http.createServer(async (req, res) => {
       }
       if (event.type === "checkout.session.completed") {
         const subId = obj.subscription;
-        if (subId) await supabasePatch("subscriptions", { stripe_subscription_id: `eq.${obj.id}` }, { stripe_subscription_id: subId, status: "active" });
+        const meta = obj.metadata || {};
+        const planMap = {
+          starter: { payout: 10, price: 29.95 },
+          growth:  { payout: 12, price: 59.95 },
+          pro:     { payout: 15, price: 99.95 },
+        };
+        const plan = planMap[meta.planId] || planMap.starter;
+
+        // Save vendor to Supabase
+        if (meta.vendorName && obj.customer_email) {
+          const vendorBody = JSON.stringify({
+            name:           `${meta.firstName || ""} ${meta.lastName || ""}`.trim() || meta.vendorName,
+            email:          obj.customer_email.toLowerCase().trim(),
+            phone:          meta.phone || "",
+            brand_name:     meta.vendorName,
+            store_name:     meta.vendorName,
+            address:        [meta.street, meta.suburb, meta.state, meta.postcode, meta.country].filter(Boolean).join(", "),
+            bank:           meta.bankName || "",
+            bsb:            meta.bsb || "",
+            account_number: meta.accountNumber || "",
+            account_name:   meta.accountName || "",
+            plan:           meta.planId || "starter",
+            payout_rate:    plan.payout,
+            status:         "pending",
+            notes:          JSON.stringify({ category: meta.category, productSlots: meta.productSlots, stripeSessionId: obj.id }),
+          });
+          const vendorRes = await httpsReq({
+            hostname: SUPA_URL.replace("https://", ""),
+            path:     "/rest/v1/vendors",
+            method:   "POST",
+            headers: {
+              "apikey":         SUPA_KEY,
+              "Authorization":  "Bearer " + SUPA_KEY,
+              "Content-Type":   "application/json",
+              "Content-Length": Buffer.byteLength(vendorBody),
+              "Prefer":         "return=representation",
+            },
+          }, vendorBody);
+
+          // Save subscription
+          if (subId) {
+            const vendor = JSON.parse(vendorRes.body)[0];
+            if (vendor && vendor.id) {
+              const subBody = JSON.stringify({
+                vendor_id:               vendor.id,
+                plan:                    meta.planId || "starter",
+                price:                   plan.price,
+                payout_rate:             plan.payout,
+                status:                  "active",
+                stripe_subscription_id:  subId,
+              });
+              await httpsReq({
+                hostname: SUPA_URL.replace("https://", ""),
+                path:     "/rest/v1/subscriptions",
+                method:   "POST",
+                headers: {
+                  "apikey":         SUPA_KEY,
+                  "Authorization":  "Bearer " + SUPA_KEY,
+                  "Content-Type":   "application/json",
+                  "Content-Length": Buffer.byteLength(subBody),
+                  "Prefer":         "return=minimal",
+                },
+              }, subBody);
+            }
+          }
+        }
       }
     } catch (e) {
       console.error("Webhook handler error:", e.message);
