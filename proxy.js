@@ -415,7 +415,7 @@ http.createServer(async (req, res) => {
     if (!SF_PRIVATE_TOKEN) {
       res.writeHead(500); return res.end(JSON.stringify({ error: "Storefront token not configured" }));
     }
-    const query = "{products(first:50){edges{node{id title handle productType images(first:1){edges{node{url}}} options{name values} variants(first:100){edges{node{id title selectedOptions{name value}}}}}}}}";
+    const query = "{products(first:50){edges{node{id title handle productType images(first:2){edges{node{url}}} options{name values} variants(first:100){edges{node{id title selectedOptions{name value}}}}}}}}";
     try {
       const r = await httpsReq({
         hostname: SF_DOMAIN,
