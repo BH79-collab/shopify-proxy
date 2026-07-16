@@ -18,6 +18,17 @@ if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
   console.warn("SUPABASE_SERVICE_ROLE_KEY is not set — falling back to the anon key for writes. This will break once RLS is enabled on the vendors/orders/payments/subscriptions tables.");
 }
 
+// Shopify Storefront API — canonical *.myshopify.com handle, not a connected
+// alias domain (aliases 401 on the Storefront API even when "Connected").
+const SF_DOMAIN  = "9b4aaf.myshopify.com";
+const SF_VERSION = "2026-07";
+// Private Storefront token — server-side only, per Shopify's own warning never
+// to expose it publicly. Set SHOPIFY_STOREFRONT_PRIVATE_TOKEN in Railway.
+const SF_PRIVATE_TOKEN = process.env.SHOPIFY_STOREFRONT_PRIVATE_TOKEN || "";
+if (!SF_PRIVATE_TOKEN) {
+  console.warn("SHOPIFY_STOREFRONT_PRIVATE_TOKEN is not set — GET /shopify/products will fail.");
+}
+
 const CORS = {
   "Access-Control-Allow-Origin":  "*",
   "Access-Control-Allow-Headers": "x-shopify-token, Content-Type, stripe-signature",
@@ -394,6 +405,31 @@ http.createServer(async (req, res) => {
       res.end(r.body);
     } catch (e) {
       res.writeHead(500); res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // GET /shopify/products — Storefront API product catalogue for onboarding.html.
+  // Uses the private Storefront token server-side; the browser never sees it.
+  if (req.method === "GET" && u.pathname === "/shopify/products") {
+    if (!SF_PRIVATE_TOKEN) {
+      res.writeHead(500); return res.end(JSON.stringify({ error: "Storefront token not configured" }));
+    }
+    const query = "{products(first:50){edges{node{id title handle productType images(first:1){edges{node{url}}} options{name values} variants(first:100){edges{node{id title selectedOptions{name value}}}}}}}}";
+    try {
+      const r = await httpsReq({
+        hostname: SF_DOMAIN,
+        path:     `/api/${SF_VERSION}/graphql.json`,
+        method:   "POST",
+        headers: {
+          "Content-Type":                  "application/json",
+          "Shopify-Storefront-Private-Token": SF_PRIVATE_TOKEN,
+        },
+      }, JSON.stringify({ query }));
+      res.writeHead(r.status, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(r.body);
+    } catch (e) {
+      res.writeHead(502); res.end(JSON.stringify({ error: e.message }));
     }
     return;
   }
