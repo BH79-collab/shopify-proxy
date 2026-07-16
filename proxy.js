@@ -8,6 +8,15 @@ const STRIPE_KEY = process.env.STRIPE_KEY  || "";
 const WHSEC      = process.env.STRIPE_WEBHOOK_SECRET || "";
 const SUPA_URL   = "https://xwennpgxsndjpbwdmcwk.supabase.co";
 const SUPA_KEY   = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inh3ZW5ucGd4c25kanBid2RtY3drIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY5ODc1MjksImV4cCI6MjA5MjU2MzUyOX0.LAyCQtlsF9puLftwyK67qwsYED7PksZeP3QoD0lmuTA";
+// Service-role key bypasses Row Level Security — required for every write this
+// proxy makes on a vendor's behalf (vendor creation, subscription/order writes).
+// Set SUPABASE_SERVICE_ROLE_KEY in Railway's environment variables; never commit it.
+// Falls back to the anon key so the proxy keeps working before RLS is enabled,
+// but writes will start failing with 401/403 once RLS is on unless this is set.
+const SUPA_WRITE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || SUPA_KEY;
+if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  console.warn("SUPABASE_SERVICE_ROLE_KEY is not set — falling back to the anon key for writes. This will break once RLS is enabled on the vendors/orders/payments/subscriptions tables.");
+}
 
 const CORS = {
   "Access-Control-Allow-Origin":  "*",
@@ -50,13 +59,53 @@ async function supabasePatch(table, match, update) {
     path:     `/rest/v1/${table}?${params}`,
     method:   "PATCH",
     headers: {
-      "apikey":          SUPA_KEY,
-      "Authorization":   "Bearer " + SUPA_KEY,
+      "apikey":          SUPA_WRITE_KEY,
+      "Authorization":   "Bearer " + SUPA_WRITE_KEY,
       "Content-Type":    "application/json",
       "Content-Length":  Buffer.byteLength(body),
       "Prefer":          "return=minimal",
     },
   }, body);
+}
+
+async function supabaseGet(path) {
+  return httpsReq({
+    hostname: SUPA_URL.replace("https://", ""),
+    path,
+    method:   "GET",
+    headers: { "apikey": SUPA_WRITE_KEY, "Authorization": "Bearer " + SUPA_WRITE_KEY },
+  });
+}
+
+async function supabasePost(table, body, prefer) {
+  const b = JSON.stringify(body);
+  return httpsReq({
+    hostname: SUPA_URL.replace("https://", ""),
+    path:     `/rest/v1/${table}`,
+    method:   "POST",
+    headers: {
+      "apikey":         SUPA_WRITE_KEY,
+      "Authorization":  "Bearer " + SUPA_WRITE_KEY,
+      "Content-Type":   "application/json",
+      "Content-Length": Buffer.byteLength(b),
+      "Prefer":         prefer || "return=minimal",
+    },
+  }, b);
+}
+
+// Insert or update the vendor row by email, and always set auth_user_id so
+// index.html can look the vendor up by their Supabase Auth session.
+async function upsertVendor(email, authUserId, fields) {
+  const existing = await supabaseGet(`/rest/v1/vendors?email=eq.${encodeURIComponent(email)}&select=id`);
+  const rows = JSON.parse(existing.body || "[]");
+  const payload = { ...fields, email, auth_user_id: authUserId || null };
+  if (rows.length) {
+    await supabasePatch("vendors", { id: `eq.${rows[0].id}` }, payload);
+    return { id: rows[0].id, created: false };
+  }
+  const created = await supabasePost("vendors", payload, "return=representation");
+  const vendor = JSON.parse(created.body || "[]")[0];
+  return { id: vendor?.id, created: true };
 }
 
 function readBody(req) {
@@ -188,12 +237,7 @@ http.createServer(async (req, res) => {
         const subId = obj.subscription;
         if (subId) {
           await supabasePatch("subscriptions", { stripe_subscription_id: `eq.${subId}` }, { status: "past_due" });
-          const subRes = await httpsReq({
-            hostname: SUPA_URL.replace("https://",""),
-            path:     `/rest/v1/subscriptions?stripe_subscription_id=eq.${subId}&select=vendor_id`,
-            method:   "GET",
-            headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY },
-          });
+          const subRes = await supabaseGet(`/rest/v1/subscriptions?stripe_subscription_id=eq.${subId}&select=vendor_id`);
           const subs = JSON.parse(subRes.body);
           if (subs.length) await supabasePatch("vendors", { id: `eq.${subs[0].vendor_id}` }, { status: "paused" });
         }
@@ -213,9 +257,9 @@ http.createServer(async (req, res) => {
 
         // Save vendor to Supabase
         if (meta.vendorName && obj.customer_email) {
-          const vendorBody = JSON.stringify({
+          const email = obj.customer_email.toLowerCase().trim();
+          const { id: vendorId } = await upsertVendor(email, meta.authUserId, {
             name:           `${meta.firstName || ""} ${meta.lastName || ""}`.trim() || meta.vendorName,
-            email:          obj.customer_email.toLowerCase().trim(),
             phone:          meta.phone || "",
             brand_name:     meta.vendorName,
             store_name:     meta.vendorName,
@@ -229,44 +273,17 @@ http.createServer(async (req, res) => {
             status:         "pending",
             notes:          JSON.stringify({ category: meta.category, productSlots: meta.productSlots, stripeSessionId: obj.id }),
           });
-          const vendorRes = await httpsReq({
-            hostname: SUPA_URL.replace("https://", ""),
-            path:     "/rest/v1/vendors",
-            method:   "POST",
-            headers: {
-              "apikey":         SUPA_KEY,
-              "Authorization":  "Bearer " + SUPA_KEY,
-              "Content-Type":   "application/json",
-              "Content-Length": Buffer.byteLength(vendorBody),
-              "Prefer":         "return=representation",
-            },
-          }, vendorBody);
 
           // Save subscription
-          if (subId) {
-            const vendor = JSON.parse(vendorRes.body)[0];
-            if (vendor && vendor.id) {
-              const subBody = JSON.stringify({
-                vendor_id:               vendor.id,
-                plan:                    meta.planId || "starter",
-                price:                   plan.price,
-                payout_rate:             plan.payout,
-                status:                  "active",
-                stripe_subscription_id:  subId,
-              });
-              await httpsReq({
-                hostname: SUPA_URL.replace("https://", ""),
-                path:     "/rest/v1/subscriptions",
-                method:   "POST",
-                headers: {
-                  "apikey":         SUPA_KEY,
-                  "Authorization":  "Bearer " + SUPA_KEY,
-                  "Content-Type":   "application/json",
-                  "Content-Length": Buffer.byteLength(subBody),
-                  "Prefer":         "return=minimal",
-                },
-              }, subBody);
-            }
+          if (subId && vendorId) {
+            await supabasePost("subscriptions", {
+              vendor_id:               vendorId,
+              plan:                    meta.planId || "starter",
+              price:                   plan.price,
+              payout_rate:             plan.payout,
+              status:                  "active",
+              stripe_subscription_id:  subId,
+            });
           }
         }
       }
@@ -274,6 +291,63 @@ http.createServer(async (req, res) => {
       console.error("Webhook handler error:", e.message);
     }
     res.writeHead(200); res.end(JSON.stringify({ received: true }));
+    return;
+  }
+
+  // POST /vendor/save — client-side fallback save, called by onboarding.html
+  // after a successful Stripe redirect in case the /stripe/webhook call above
+  // was missed or hasn't landed yet. Upserts by email, same as the webhook path.
+  if (req.method === "POST" && u.pathname === "/vendor/save") {
+    const raw = await readBody(req);
+    try {
+      const { meta, email, authUserId, subscriptionId } = JSON.parse(raw.toString());
+      if (!meta || !email) {
+        res.writeHead(400); return res.end(JSON.stringify({ error: "missing meta or email" }));
+      }
+      const planMap = {
+        starter: { payout: 10, price: 29.95 },
+        growth:  { payout: 12, price: 59.95 },
+        pro:     { payout: 15, price: 99.95 },
+      };
+      const plan = planMap[meta.planId] || planMap.starter;
+      const cleanEmail = email.toLowerCase().trim();
+
+      const { id: vendorId } = await upsertVendor(cleanEmail, authUserId, {
+        name:           `${meta.firstName || ""} ${meta.lastName || ""}`.trim() || meta.vendorName,
+        phone:          meta.phone || "",
+        brand_name:     meta.vendorName,
+        store_name:     meta.vendorName,
+        address:        [meta.street, meta.suburb, meta.state, meta.postcode, meta.country].filter(Boolean).join(", "),
+        bank:           meta.bankName || "",
+        bsb:            meta.bsb || "",
+        account_number: meta.accountNumber || "",
+        account_name:   meta.accountName || "",
+        plan:           meta.planId || "starter",
+        payout_rate:    plan.payout,
+        status:         "pending",
+        notes:          JSON.stringify({ category: meta.category, productSlots: meta.productSlots }),
+      });
+
+      if (subscriptionId && vendorId) {
+        const existingSub = await supabaseGet(`/rest/v1/subscriptions?stripe_subscription_id=eq.${subscriptionId}&select=id`);
+        if (!JSON.parse(existingSub.body || "[]").length) {
+          await supabasePost("subscriptions", {
+            vendor_id:              vendorId,
+            plan:                   meta.planId || "starter",
+            price:                  plan.price,
+            payout_rate:            plan.payout,
+            status:                 "active",
+            stripe_subscription_id: subscriptionId,
+          });
+        }
+      }
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ saved: true, vendorId }));
+    } catch (e) {
+      console.error("Vendor save error:", e.message);
+      res.writeHead(500); res.end(JSON.stringify({ error: e.message }));
+    }
     return;
   }
 
@@ -290,7 +364,7 @@ http.createServer(async (req, res) => {
         vendor:     item.vendor,
         sku:        item.sku,
       }));
-      const orderBody = JSON.stringify({
+      await supabasePost("orders", {
         shopify_order_id: order.id?.toString(),
         order_number:     order.order_number?.toString(),
         customer_name:    `${order.customer?.first_name || ""} ${order.customer?.last_name || ""}`.trim(),
@@ -300,18 +374,6 @@ http.createServer(async (req, res) => {
         status:           order.financial_status || "pending",
         created_at:       order.created_at,
       });
-      await httpsReq({
-        hostname: SUPA_URL.replace("https://", ""),
-        path:     "/rest/v1/orders",
-        method:   "POST",
-        headers: {
-          "apikey":         SUPA_KEY,
-          "Authorization":  "Bearer " + SUPA_KEY,
-          "Content-Type":   "application/json",
-          "Content-Length": Buffer.byteLength(orderBody),
-          "Prefer":         "return=minimal",
-        },
-      }, orderBody);
       res.writeHead(200); res.end(JSON.stringify({ received: true }));
     } catch (e) {
       console.error("Order webhook error:", e.message);
@@ -321,17 +383,13 @@ http.createServer(async (req, res) => {
   }
 
   // GET /supabase/orders (payout app reads orders from Supabase)
+  // NOTE: this endpoint is unauthenticated — it uses the service-role key to read
+  // across all vendors, so anyone who can reach this proxy can call it. It needs
+  // an access check (e.g. an admin-only header/token) before payout.html is
+  // pointed at it; tracked separately from this auth fix.
   if (req.method === "GET" && u.pathname === "/supabase/orders") {
     try {
-      const r = await httpsReq({
-        hostname: SUPA_URL.replace("https://", ""),
-        path:     "/rest/v1/orders?select=*&order=created_at.desc&limit=250",
-        method:   "GET",
-        headers: {
-          "apikey":        SUPA_KEY,
-          "Authorization": "Bearer " + SUPA_KEY,
-        },
-      });
+      const r = await supabaseGet("/rest/v1/orders?select=*&order=created_at.desc&limit=250");
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
       res.end(r.body);
     } catch (e) {
