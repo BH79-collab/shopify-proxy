@@ -119,6 +119,39 @@ async function upsertVendor(email, authUserId, fields) {
   return { id: vendor?.id, created: true };
 }
 
+async function supabaseDelete(path) {
+  return httpsReq({
+    hostname: SUPA_URL.replace("https://", ""),
+    path,
+    method: "DELETE",
+    headers: { "apikey": SUPA_WRITE_KEY, "Authorization": "Bearer " + SUPA_WRITE_KEY, "Prefer": "return=minimal" },
+  });
+}
+
+// Replaces a vendor's product/logo selection wholesale from the onboarding
+// wizard's productSlots JSON. Called only from /vendor/save, which receives
+// the full untruncated data as a JSON body — Stripe checkout metadata caps
+// each value at 500 characters, so this can't safely go through the webhook.
+async function replaceVendorProducts(vendorId, productSlotsJson) {
+  let slots;
+  try { slots = JSON.parse(productSlotsJson || "[]"); } catch { slots = []; }
+  slots = (slots || []).filter(s => s && s.productId);
+
+  await supabaseDelete(`/rest/v1/vendor_products?vendor_id=eq.${vendorId}`);
+  if (!slots.length) return;
+
+  await supabasePost("vendor_products", slots.map(s => ({
+    vendor_id:       vendorId,
+    product_id:      s.productId,
+    colours:         s.colours || [],
+    sizes:           s.sizes || [],
+    front_logo_url:  s.frontLogo?.url || null,
+    back_logo_url:   s.backLogo?.url || null,
+    front_placement: s.frontPl || null,
+    back_placement:  s.backPl || null,
+  })));
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -282,7 +315,7 @@ http.createServer(async (req, res) => {
             plan:           meta.planId || "starter",
             payout_rate:    plan.payout,
             status:         "pending",
-            notes:          JSON.stringify({ category: meta.category, productSlots: meta.productSlots, stripeSessionId: obj.id }),
+            notes:          JSON.stringify({ category: meta.category, stripeSessionId: obj.id }),
           });
 
           // Save subscription
@@ -336,8 +369,10 @@ http.createServer(async (req, res) => {
         plan:           meta.planId || "starter",
         payout_rate:    plan.payout,
         status:         "pending",
-        notes:          JSON.stringify({ category: meta.category, productSlots: meta.productSlots }),
+        notes:          JSON.stringify({ category: meta.category }),
       });
+
+      if (vendorId) await replaceVendorProducts(vendorId, meta.productSlots);
 
       if (subscriptionId && vendorId) {
         const existingSub = await supabaseGet(`/rest/v1/subscriptions?stripe_subscription_id=eq.${subscriptionId}&select=id`);
