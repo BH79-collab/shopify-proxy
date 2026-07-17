@@ -75,7 +75,7 @@ async function stripePost(path, params) {
 async function supabasePatch(table, match, update) {
   const params = new URLSearchParams(match).toString();
   const body   = JSON.stringify(update);
-  return httpsReq({
+  const r = await httpsReq({
     hostname: SUPA_URL.replace("https://",""),
     path:     `/rest/v1/${table}?${params}`,
     method:   "PATCH",
@@ -87,6 +87,8 @@ async function supabasePatch(table, match, update) {
       "Prefer":          "return=minimal",
     },
   }, body);
+  if (r.status >= 300) throw new Error(`Supabase PATCH ${table} failed (${r.status}): ${r.body}`);
+  return r;
 }
 
 async function supabaseGet(path) {
@@ -100,7 +102,7 @@ async function supabaseGet(path) {
 
 async function supabasePost(table, body, prefer) {
   const b = JSON.stringify(body);
-  return httpsReq({
+  const r = await httpsReq({
     hostname: SUPA_URL.replace("https://", ""),
     path:     `/rest/v1/${table}`,
     method:   "POST",
@@ -112,6 +114,8 @@ async function supabasePost(table, body, prefer) {
       "Prefer":         prefer || "return=minimal",
     },
   }, b);
+  if (r.status >= 300) throw new Error(`Supabase POST ${table} failed (${r.status}): ${r.body}`);
+  return r;
 }
 
 // Insert or update the vendor row by email, and always set auth_user_id so
@@ -130,12 +134,14 @@ async function upsertVendor(email, authUserId, fields) {
 }
 
 async function supabaseDelete(path) {
-  return httpsReq({
+  const r = await httpsReq({
     hostname: SUPA_URL.replace("https://", ""),
     path,
     method: "DELETE",
     headers: { "apikey": SUPA_WRITE_KEY, "Authorization": "Bearer " + SUPA_WRITE_KEY, "Prefer": "return=minimal" },
   });
+  if (r.status >= 300) throw new Error(`Supabase DELETE ${path} failed (${r.status}): ${r.body}`);
+  return r;
 }
 
 // ── Shopify Admin API (write access — publishing only) ──────────────────────
