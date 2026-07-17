@@ -29,6 +29,16 @@ if (!SF_PRIVATE_TOKEN) {
   console.warn("SHOPIFY_STOREFRONT_PRIVATE_TOKEN is not set — GET /shopify/products will fail.");
 }
 
+// Admin API token — write access, used only for the admin "Approve & Publish
+// to Shopify" action (creates live products/collections). Far more
+// privileged than the Storefront token; never sent to any client.
+// Set SHOPIFY_ADMIN_API_TOKEN in Railway.
+const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_API_TOKEN || "";
+if (!SHOPIFY_ADMIN_TOKEN) {
+  console.warn("SHOPIFY_ADMIN_API_TOKEN is not set — POST /shopify/publish-vendor will fail.");
+}
+const RETAIL_MARKUP = 20; // added to the base product's price for the vendor's branded listing
+
 const CORS = {
   "Access-Control-Allow-Origin":  "*",
   "Access-Control-Allow-Headers": "x-shopify-token, Content-Type, stripe-signature",
@@ -128,6 +138,62 @@ async function supabaseDelete(path) {
   });
 }
 
+// ── Shopify Admin API (write access — publishing only) ──────────────────────
+async function shopifyAdminReq(method, path, body) {
+  const b = body ? JSON.stringify(body) : null;
+  const headers = {
+    "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
+    "Content-Type": "application/json",
+  };
+  if (b) headers["Content-Length"] = Buffer.byteLength(b);
+  const r = await httpsReq({
+    hostname: SF_DOMAIN,
+    path: `/admin/api/${SF_VERSION}${path}`,
+    method,
+    headers,
+  }, b);
+  let data;
+  try { data = JSON.parse(r.body || "{}"); } catch { data = {}; }
+  return { status: r.status, data };
+}
+
+// Storefront GIDs look like "gid://shopify/Product/9350089474336" — the
+// Admin REST API wants just the trailing numeric id.
+function numericIdFromGid(gid) {
+  const m = String(gid || "").match(/(\d+)$/);
+  return m ? m[1] : null;
+}
+
+async function getBaseProduct(productGid) {
+  const id = numericIdFromGid(productGid);
+  if (!id) return null;
+  const { status, data } = await shopifyAdminReq("GET", `/products/${id}.json`);
+  if (status !== 200 || !data.product) return null;
+  return data.product;
+}
+
+// Finds the vendor's custom collection by title (matches what the old manual
+// "Setup in Shopify" flow created), or creates one if it doesn't exist yet.
+async function findOrCreateCollection(title) {
+  const search = await shopifyAdminReq("GET", `/custom_collections.json?title=${encodeURIComponent(title)}`);
+  const existing = search.data?.custom_collections?.find(c => c.title === title);
+  if (existing) return existing.id;
+
+  const created = await shopifyAdminReq("POST", "/custom_collections.json", {
+    custom_collection: { title, published: true },
+  });
+  if (created.status !== 201 || !created.data.custom_collection) {
+    throw new Error("Could not create Shopify collection: " + JSON.stringify(created.data));
+  }
+  return created.data.custom_collection.id;
+}
+
+async function addProductToCollection(productId, collectionId) {
+  await shopifyAdminReq("POST", "/collects.json", {
+    collect: { product_id: productId, collection_id: collectionId },
+  });
+}
+
 // Replaces a vendor's product/logo selection wholesale from the onboarding
 // wizard's productSlots JSON. Called only from /vendor/save, which receives
 // the full untruncated data as a JSON body — Stripe checkout metadata caps
@@ -150,6 +216,57 @@ async function replaceVendorProducts(vendorId, productSlotsJson) {
     front_placement: s.frontPl || null,
     back_placement:  s.backPl || null,
   })));
+}
+
+// Creates a live Shopify product for one vendor_products row: looks up the
+// base product's price (+ RETAIL_MARKUP), builds colour/size variants,
+// attaches the pre-generated mockup image(s), and adds it to the vendor's
+// collection. Returns the created product's numeric id.
+async function publishVendorProduct(vendor, vp, collectionId) {
+  const base = await getBaseProduct(vp.product_id);
+  if (!base) throw new Error(`Base Shopify product not found for ${vp.product_id}`);
+
+  const basePrice = parseFloat(base.variants?.[0]?.price || "0");
+  const price = (basePrice + RETAIL_MARKUP).toFixed(2);
+  const brandName = vendor.brand_name || vendor.store_name || vendor.name || "Vendor";
+
+  const colours = (vp.colours || []).length ? vp.colours : [null];
+  const sizes   = (vp.sizes   || []).length ? vp.sizes   : [null];
+  const options = [];
+  if (vp.colours?.length) options.push({ name: "Colour", values: vp.colours });
+  if (vp.sizes?.length)   options.push({ name: "Size",   values: vp.sizes });
+
+  const variants = [];
+  colours.forEach(c => {
+    sizes.forEach(s => {
+      const optionValues = [c, s].filter(v => v !== null);
+      const variant = { price, inventory_management: null };
+      optionValues.forEach((v, i) => { variant[`option${i + 1}`] = v; });
+      variants.push(variant);
+    });
+  });
+
+  const images = [];
+  if (vp.front_mockup_url) images.push({ src: vp.front_mockup_url });
+  if (vp.back_mockup_url)  images.push({ src: vp.back_mockup_url });
+
+  const created = await shopifyAdminReq("POST", "/products.json", {
+    product: {
+      title: `${base.title} — ${brandName}`,
+      vendor: brandName,
+      product_type: base.product_type || "",
+      status: "active",
+      options: options.length ? options : undefined,
+      variants,
+      images,
+    },
+  });
+  if (created.status !== 201 || !created.data.product) {
+    throw new Error(`Shopify product creation failed: ${JSON.stringify(created.data)}`);
+  }
+  const productId = created.data.product.id;
+  await addProductToCollection(productId, collectionId);
+  return productId;
 }
 
 function readBody(req) {
@@ -466,6 +583,81 @@ http.createServer(async (req, res) => {
     } catch (e) {
       res.writeHead(502); res.end(JSON.stringify({ error: e.message }));
     }
+    return;
+  }
+
+  // POST /shopify/publish-vendor — admin-triggered: creates a live Shopify
+  // product (with composited mockup image, price = base + markup) for each
+  // of a vendor's chosen products, in their brand collection. Expects the
+  // client to have already generated and saved mockup URLs onto the
+  // vendor_products rows (compositing needs canvas/image work best done
+  // browser-side) — this endpoint just does the privileged Shopify writes.
+  if (req.method === "POST" && u.pathname === "/shopify/publish-vendor") {
+    if (!SHOPIFY_ADMIN_TOKEN) {
+      res.writeHead(500); return res.end(JSON.stringify({ error: "Shopify Admin API token not configured" }));
+    }
+    const raw = await readBody(req);
+    try {
+      const { vendorId } = JSON.parse(raw.toString());
+      if (!vendorId) { res.writeHead(400); return res.end(JSON.stringify({ error: "missing vendorId" })); }
+
+      const vendorRes = await supabaseGet(`/rest/v1/vendors?id=eq.${vendorId}&select=*`);
+      const vendor = JSON.parse(vendorRes.body || "[]")[0];
+      if (!vendor) { res.writeHead(404); return res.end(JSON.stringify({ error: "vendor not found" })); }
+
+      const vpRes = await supabaseGet(`/rest/v1/vendor_products?vendor_id=eq.${vendorId}&select=*`);
+      const products = JSON.parse(vpRes.body || "[]");
+
+      const collectionTitle = vendor.brand_name || vendor.store_name || vendor.name || "Vendor";
+      const collectionId = await findOrCreateCollection(collectionTitle);
+
+      const results = [];
+      for (const vp of products) {
+        if (vp.shopify_product_id) {
+          results.push({ productId: vp.product_id, status: "skipped", reason: "already published" });
+          continue;
+        }
+        try {
+          const shopifyProductId = await publishVendorProduct(vendor, vp, collectionId);
+          await supabasePatch("vendor_products", { id: `eq.${vp.id}` }, {
+            shopify_product_id: String(shopifyProductId),
+            published_at: new Date().toISOString(),
+          });
+          results.push({ productId: vp.product_id, status: "published", shopifyProductId });
+        } catch (e) {
+          results.push({ productId: vp.product_id, status: "error", error: e.message });
+        }
+      }
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ collectionId, results }));
+    } catch (e) {
+      res.writeHead(500); res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // GET /image-proxy?url=... — streams back an image with permissive CORS
+  // headers regardless of the source's own CORS policy, so the admin's
+  // browser can composite Shopify/Supabase-hosted images onto a <canvas>
+  // for mockup generation without hitting a cross-origin taint error.
+  // Restricted to known image hosts to avoid becoming an open SSRF proxy.
+  if (req.method === "GET" && u.pathname === "/image-proxy") {
+    const target = u.searchParams.get("url");
+    let parsed;
+    try { parsed = new URL(target); } catch { res.writeHead(400); return res.end(JSON.stringify({ error: "bad url" })); }
+    const allowedHosts = [SF_DOMAIN, "cdn.shopify.com", SUPA_URL.replace("https://", "")];
+    if (!allowedHosts.some(h => parsed.hostname === h || parsed.hostname.endsWith("." + h))) {
+      res.writeHead(403); return res.end(JSON.stringify({ error: "host not allowed" }));
+    }
+    https.get(parsed, upstream => {
+      res.writeHead(upstream.statusCode, {
+        "Content-Type": upstream.headers["content-type"] || "application/octet-stream",
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "public, max-age=3600",
+      });
+      upstream.pipe(res);
+    }).on("error", e => { res.writeHead(502); res.end(JSON.stringify({ error: e.message })); });
     return;
   }
 
