@@ -195,18 +195,22 @@ async function findOrCreateCollection(title) {
 }
 
 async function addProductToCollection(productId, collectionId) {
-  await shopifyAdminReq("POST", "/collects.json", {
+  const r = await shopifyAdminReq("POST", "/collects.json", {
     collect: { product_id: productId, collection_id: collectionId },
   });
+  if (r.status !== 201) throw new Error(`Adding product to collection failed: ${JSON.stringify(r.data)}`);
+  return r;
 }
 
 // Attaches an image to specific variants (e.g. all "Black" variants across
 // sizes) so the storefront swaps to the right mockup when a customer picks
 // that colour, instead of showing one generic image for every variant.
 async function addVariantImage(productId, src, variantIds) {
-  return shopifyAdminReq("POST", `/products/${productId}/images.json`, {
+  const r = await shopifyAdminReq("POST", `/products/${productId}/images.json`, {
     image: { src, variant_ids: variantIds },
   });
+  if (r.status !== 201) throw new Error(`Attaching variant image failed: ${JSON.stringify(r.data)}`);
+  return r;
 }
 
 // Replaces a vendor's product/logo selection wholesale from the onboarding
