@@ -228,6 +228,31 @@ async function addVariantImage(productId, src, variantIds) {
   return r;
 }
 
+// Marks a Shopify order fulfilled (optionally with tracking info), so
+// whatever ShipStation/Shopify-side automation is watching for that status
+// picks it up. Uses the modern FulfillmentOrder flow, not the legacy
+// order-level fulfillment endpoint.
+async function fulfillShopifyOrder(shopifyOrderId, trackingNumber, trackingCompany) {
+  const foRes = await shopifyAdminReq("GET", `/orders/${shopifyOrderId}/fulfillment_orders.json`);
+  if (foRes.status !== 200) throw new Error(`Could not fetch fulfillment orders: ${JSON.stringify(foRes.data)}`);
+  const openFOs = (foRes.data.fulfillment_orders || []).filter(fo => fo.status === "open" || fo.status === "in_progress");
+  if (!openFOs.length) throw new Error("No open fulfillment orders found for this order — it may already be fulfilled");
+
+  const body = {
+    fulfillment: {
+      line_items_by_fulfillment_order: openFOs.map(fo => ({ fulfillment_order_id: fo.id })),
+      notify_customer: true,
+    },
+  };
+  if (trackingNumber) {
+    body.fulfillment.tracking_info = { number: trackingNumber, company: trackingCompany || undefined };
+  }
+
+  const created = await shopifyAdminReq("POST", "/fulfillments.json", body);
+  if (created.status !== 201) throw new Error(`Fulfillment failed: ${JSON.stringify(created.data)}`);
+  return created.data.fulfillment;
+}
+
 // Replaces a vendor's product/logo selection wholesale from the onboarding
 // wizard's productSlots JSON. Called only from /vendor/save, which receives
 // the full untruncated data as a JSON body — Stripe checkout metadata caps
@@ -599,12 +624,14 @@ http.createServer(async (req, res) => {
         const vendor = JSON.parse(vendorRes.body || "[]")[0];
         rows.push({
           shopify_order_id:  order.id?.toString(),
+          order_number:      order.name || order.order_number?.toString() || null,
           vendor_id:         match.vendor_id,
           vendor_product_id: match.id,
           variant_title:     item.variant_title || null,
           product_title:     item.title,
           collection_id:     vendor?.collection_id || null,
           quantity:         item.quantity,
+          unit_price:       parseFloat(item.price || 0),
           revenue:          parseFloat(item.price || 0) * (item.quantity || 0),
           order_date:       orderDateStr,
           period,
@@ -714,6 +741,33 @@ http.createServer(async (req, res) => {
 
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ collectionId, results }));
+    } catch (e) {
+      res.writeHead(500); res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // POST /shopify/fulfill-order — admin marks an order shipped; tells
+  // Shopify directly (ShipStation and anything else watching fulfillment
+  // status on the Shopify side picks it up from there).
+  if (req.method === "POST" && u.pathname === "/shopify/fulfill-order") {
+    if (!SHOPIFY_ADMIN_TOKEN) {
+      res.writeHead(500); return res.end(JSON.stringify({ error: "Shopify Admin API token not configured" }));
+    }
+    const raw = await readBody(req);
+    try {
+      const { shopifyOrderId, trackingNumber, trackingCompany } = JSON.parse(raw.toString());
+      if (!shopifyOrderId) { res.writeHead(400); return res.end(JSON.stringify({ error: "missing shopifyOrderId" })); }
+
+      const fulfillment = await fulfillShopifyOrder(shopifyOrderId, trackingNumber, trackingCompany);
+      await supabasePatch("orders", { shopify_order_id: `eq.${shopifyOrderId}` }, {
+        fulfillment_status: "fulfilled",
+        tracking_number:    trackingNumber || null,
+        tracking_company:   trackingCompany || null,
+        fulfilled_at:       new Date().toISOString(),
+      });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ fulfilled: true, fulfillmentId: fulfillment.id }));
     } catch (e) {
       res.writeHead(500); res.end(JSON.stringify({ error: e.message }));
     }
