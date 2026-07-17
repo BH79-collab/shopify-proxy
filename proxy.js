@@ -589,7 +589,7 @@ http.createServer(async (req, res) => {
       for (const item of order.line_items || []) {
         const productId = item.product_id?.toString();
         if (!productId) continue;
-        const vpRes = await supabaseGet(`/rest/v1/vendor_products?shopify_product_id=eq.${productId}&select=vendor_id`);
+        const vpRes = await supabaseGet(`/rest/v1/vendor_products?shopify_product_id=eq.${productId}&select=id,vendor_id`);
         const match = JSON.parse(vpRes.body || "[]")[0];
         if (!match) {
           console.warn(`Order ${order.id}: no vendor found for Shopify product ${productId} (${item.title}) — skipping line item`);
@@ -598,10 +598,12 @@ http.createServer(async (req, res) => {
         const vendorRes = await supabaseGet(`/rest/v1/vendors?id=eq.${match.vendor_id}&select=collection_id`);
         const vendor = JSON.parse(vendorRes.body || "[]")[0];
         rows.push({
-          shopify_order_id: order.id?.toString(),
-          vendor_id:        match.vendor_id,
-          product_title:    item.title,
-          collection_id:    vendor?.collection_id || null,
+          shopify_order_id:  order.id?.toString(),
+          vendor_id:         match.vendor_id,
+          vendor_product_id: match.id,
+          variant_title:     item.variant_title || null,
+          product_title:     item.title,
+          collection_id:     vendor?.collection_id || null,
           quantity:         item.quantity,
           revenue:          parseFloat(item.price || 0) * (item.quantity || 0),
           order_date:       orderDateStr,
