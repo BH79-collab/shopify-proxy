@@ -577,27 +577,39 @@ http.createServer(async (req, res) => {
     }
     try {
       const order = JSON.parse(raw.toString());
-      const lineItems = (order.line_items || []).map(item => ({
-        product_id:   item.product_id?.toString(),
-        variant_id:   item.variant_id?.toString(),
-        variant_title: item.variant_title,
-        title:        item.title,
-        quantity:     item.quantity,
-        price:        parseFloat(item.price),
-        vendor:       item.vendor,
-        sku:          item.sku,
-      }));
-      await supabasePost("orders", {
-        shopify_order_id: order.id?.toString(),
-        order_number:     order.order_number?.toString(),
-        customer_name:    `${order.customer?.first_name || ""} ${order.customer?.last_name || ""}`.trim(),
-        customer_email:   order.customer?.email || "",
-        total_price:      parseFloat(order.total_price || 0),
-        line_items:       lineItems,
-        status:           order.financial_status || "pending",
-        created_at:       order.created_at,
-      });
-      res.writeHead(200); res.end(JSON.stringify({ received: true }));
+      const orderDate = new Date(order.created_at || Date.now());
+      const orderDateStr = orderDate.toISOString().slice(0, 10);
+      const period = orderDate.toLocaleString("en-AU", { month: "long", year: "numeric" });
+
+      // orders is one row per line item (not per order) — vendor_id is how
+      // the rest of the app (dashboards, payouts) attributes a sale to a
+      // vendor, found by matching the Shopify product back to whichever
+      // vendor_products row published it.
+      const rows = [];
+      for (const item of order.line_items || []) {
+        const productId = item.product_id?.toString();
+        if (!productId) continue;
+        const vpRes = await supabaseGet(`/rest/v1/vendor_products?shopify_product_id=eq.${productId}&select=vendor_id`);
+        const match = JSON.parse(vpRes.body || "[]")[0];
+        if (!match) {
+          console.warn(`Order ${order.id}: no vendor found for Shopify product ${productId} (${item.title}) — skipping line item`);
+          continue;
+        }
+        const vendorRes = await supabaseGet(`/rest/v1/vendors?id=eq.${match.vendor_id}&select=collection_id`);
+        const vendor = JSON.parse(vendorRes.body || "[]")[0];
+        rows.push({
+          shopify_order_id: order.id?.toString(),
+          vendor_id:        match.vendor_id,
+          product_title:    item.title,
+          collection_id:    vendor?.collection_id || null,
+          quantity:         item.quantity,
+          revenue:          parseFloat(item.price || 0) * (item.quantity || 0),
+          order_date:       orderDateStr,
+          period,
+        });
+      }
+      if (rows.length) await supabasePost("orders", rows);
+      res.writeHead(200); res.end(JSON.stringify({ received: true, linesSaved: rows.length }));
     } catch (e) {
       console.error("Order webhook error:", e.message);
       res.writeHead(500); res.end(JSON.stringify({ error: e.message }));
@@ -676,6 +688,9 @@ http.createServer(async (req, res) => {
 
       const collectionTitle = vendor.brand_name || vendor.store_name || vendor.name || "Vendor";
       const collectionId = await findOrCreateCollection(collectionTitle);
+      if (String(vendor.collection_id) !== String(collectionId)) {
+        await supabasePatch("vendors", { id: `eq.${vendorId}` }, { collection_id: String(collectionId) });
+      }
 
       const results = [];
       for (const vp of products) {
