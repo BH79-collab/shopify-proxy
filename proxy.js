@@ -200,6 +200,15 @@ async function addProductToCollection(productId, collectionId) {
   });
 }
 
+// Attaches an image to specific variants (e.g. all "Black" variants across
+// sizes) so the storefront swaps to the right mockup when a customer picks
+// that colour, instead of showing one generic image for every variant.
+async function addVariantImage(productId, src, variantIds) {
+  return shopifyAdminReq("POST", `/products/${productId}/images.json`, {
+    image: { src, variant_ids: variantIds },
+  });
+}
+
 // Replaces a vendor's product/logo selection wholesale from the onboarding
 // wizard's productSlots JSON. Called only from /vendor/save, which receives
 // the full untruncated data as a JSON body — Stripe checkout metadata caps
@@ -252,6 +261,9 @@ async function publishVendorProduct(vendor, vp, collectionId) {
     });
   });
 
+  // Default/hero images shown before a variant is picked. When colour_mockups
+  // exists, front_mockup_url/back_mockup_url already hold the first colour's
+  // mockups (set client-side), so this doubles as a sensible default.
   const images = [];
   if (vp.front_mockup_url) images.push({ src: vp.front_mockup_url });
   if (vp.back_mockup_url)  images.push({ src: vp.back_mockup_url });
@@ -259,6 +271,7 @@ async function publishVendorProduct(vendor, vp, collectionId) {
   const created = await shopifyAdminReq("POST", "/products.json", {
     product: {
       title: `${base.title} — ${brandName}`,
+      body_html: base.body_html || "",
       vendor: brandName,
       product_type: base.product_type || "",
       status: "active",
@@ -272,6 +285,23 @@ async function publishVendorProduct(vendor, vp, collectionId) {
   }
   const productId = created.data.product.id;
   await addProductToCollection(productId, collectionId);
+
+  // Attach a mockup per colour to just that colour's variants, so switching
+  // colour on the storefront shows the design on the actual colour picked —
+  // not one generic shot reused for every variant.
+  if (vp.colour_mockups) {
+    const variantsByColour = {};
+    (created.data.product.variants || []).forEach(v => {
+      (variantsByColour[v.option1] = variantsByColour[v.option1] || []).push(v.id);
+    });
+    for (const [colour, mockups] of Object.entries(vp.colour_mockups)) {
+      const variantIds = variantsByColour[colour];
+      if (!variantIds) continue;
+      if (mockups.front) await addVariantImage(productId, mockups.front, variantIds);
+      if (mockups.back)  await addVariantImage(productId, mockups.back, variantIds);
+    }
+  }
+
   return productId;
 }
 
@@ -573,7 +603,7 @@ http.createServer(async (req, res) => {
     if (!SF_PRIVATE_TOKEN) {
       res.writeHead(500); return res.end(JSON.stringify({ error: "Storefront token not configured" }));
     }
-    const query = "{products(first:50){edges{node{id title handle productType images(first:2){edges{node{url}}} options{name values} variants(first:100){edges{node{id title selectedOptions{name value}}}}}}}}";
+    const query = "{products(first:50){edges{node{id title handle productType images(first:2){edges{node{url}}} options{name values} variants(first:100){edges{node{id title selectedOptions{name value} image{url}}}}}}}}";
     try {
       const r = await httpsReq({
         hostname: SF_DOMAIN,
