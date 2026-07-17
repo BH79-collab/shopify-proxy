@@ -39,6 +39,21 @@ if (!SHOPIFY_ADMIN_TOKEN) {
 }
 const RETAIL_MARKUP = 20; // added to the base product's price for the vendor's branded listing
 
+// App client secret — used only to verify Shopify webhook signatures
+// (X-Shopify-Hmac-Sha256), so /shopify/orders can't be spoofed by anyone who
+// finds the URL. Set SHOPIFY_APP_CLIENT_SECRET in Railway.
+const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_APP_CLIENT_SECRET || "";
+if (!SHOPIFY_CLIENT_SECRET) {
+  console.warn("SHOPIFY_APP_CLIENT_SECRET is not set — /shopify/orders will reject all webhooks until it is.");
+}
+
+function verifyShopifyWebhook(rawBody, hmacHeader) {
+  if (!SHOPIFY_CLIENT_SECRET || !hmacHeader) return false;
+  const digest = crypto.createHmac("sha256", SHOPIFY_CLIENT_SECRET).update(rawBody).digest("base64");
+  const a = Buffer.from(digest), b = Buffer.from(hmacHeader);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
 const CORS = {
   "Access-Control-Allow-Origin":  "*",
   "Access-Control-Allow-Headers": "x-shopify-token, Content-Type, stripe-signature",
@@ -557,15 +572,20 @@ http.createServer(async (req, res) => {
   // POST /shopify/orders (Shopify webhook saves orders to Supabase)
   if (req.method === "POST" && u.pathname === "/shopify/orders") {
     const raw = await readBody(req);
+    if (!verifyShopifyWebhook(raw, req.headers["x-shopify-hmac-sha256"])) {
+      res.writeHead(401); return res.end(JSON.stringify({ error: "invalid webhook signature" }));
+    }
     try {
       const order = JSON.parse(raw.toString());
       const lineItems = (order.line_items || []).map(item => ({
-        product_id: item.product_id?.toString(),
-        title:      item.title,
-        quantity:   item.quantity,
-        price:      parseFloat(item.price),
-        vendor:     item.vendor,
-        sku:        item.sku,
+        product_id:   item.product_id?.toString(),
+        variant_id:   item.variant_id?.toString(),
+        variant_title: item.variant_title,
+        title:        item.title,
+        quantity:     item.quantity,
+        price:        parseFloat(item.price),
+        vendor:       item.vendor,
+        sku:          item.sku,
       }));
       await supabasePost("orders", {
         shopify_order_id: order.id?.toString(),
