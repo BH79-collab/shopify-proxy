@@ -638,14 +638,20 @@ http.createServer(async (req, res) => {
     }
     const raw = await readBody(req);
     try {
-      const { vendorId } = JSON.parse(raw.toString());
+      const { vendorId, productRowId } = JSON.parse(raw.toString());
       if (!vendorId) { res.writeHead(400); return res.end(JSON.stringify({ error: "missing vendorId" })); }
 
       const vendorRes = await supabaseGet(`/rest/v1/vendors?id=eq.${vendorId}&select=*`);
       const vendor = JSON.parse(vendorRes.body || "[]")[0];
       if (!vendor) { res.writeHead(404); return res.end(JSON.stringify({ error: "vendor not found" })); }
 
-      const vpRes = await supabaseGet(`/rest/v1/vendor_products?vendor_id=eq.${vendorId}&select=*`);
+      // productRowId scopes this to a single product (per-row "Publish"
+      // button in the admin UI) instead of every unpublished product for
+      // the vendor.
+      const vpPath = productRowId
+        ? `/rest/v1/vendor_products?id=eq.${productRowId}&vendor_id=eq.${vendorId}&select=*`
+        : `/rest/v1/vendor_products?vendor_id=eq.${vendorId}&select=*`;
+      const vpRes = await supabaseGet(vpPath);
       const products = JSON.parse(vpRes.body || "[]");
 
       const collectionTitle = vendor.brand_name || vendor.store_name || vendor.name || "Vendor";
